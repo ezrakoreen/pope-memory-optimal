@@ -2,6 +2,8 @@
 Simple implementation of flash attention forward pass
 """
 
+import argparse
+
 import torch
 import triton 
 import triton.language as tl
@@ -20,6 +22,9 @@ def fwd_kernel(
     BLOCK_N: tl.constexpr, # kv rows per tile
     BLOCK_M: tl.constexpr # query rows per tile
 ):
+    """
+    kernel for forward pass of flash attention
+    """
     # grid indices from triton process
     # query start
     start_m = tl.program_id(0)
@@ -79,6 +84,9 @@ def fwd_kernel(
     tl.store(out_ptrs, numer, mask=offs_m[:, None] < N_CTX)
 
 def fwd_attention(q, k, v, sm_scale):
+    """
+    computes forward pass using fwd_kernel
+    """
     # B = num batches
     # H = num heads
     # S = num tokens
@@ -110,7 +118,9 @@ def fwd_attention(q, k, v, sm_scale):
 
 
 def naive_attention(q, k, v, sm_scale):
-    """Reference causal attention using PyTorch ops."""
+    """
+    baseline attention using PyTorch ops
+    """
     scores = torch.matmul(q, k.transpose(-2, -1)) * sm_scale
     causal_mask = torch.tril(
         torch.ones((q.shape[-2], k.shape[-2]), device=q.device, dtype=torch.bool)
@@ -118,3 +128,61 @@ def naive_attention(q, k, v, sm_scale):
     scores = scores.masked_fill(~causal_mask, float("-inf"))
     probs = torch.softmax(scores.float(), dim=-1).to(q.dtype)
     return torch.matmul(probs, v)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark simple flash attention kernel.")
+    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--dim", type=int, default=64)
+    parser.add_argument("--warmup", type=int, default=25)
+    parser.add_argument("--rep", type=int, default=100)
+    parser.add_argument("--check-seq-len", type=int, default=256)
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required to benchmark Triton kernels.")
+
+    device = "cuda"
+    dtype = torch.float16
+    torch.manual_seed(0)
+    sm_scale = args.dim ** -0.5
+
+    def make_inputs(seq_len):
+        shape = (args.batch, args.heads, seq_len, args.dim)
+        q = torch.randn(shape, device=device, dtype=dtype)
+        k = torch.randn(shape, device=device, dtype=dtype)
+        v = torch.randn(shape, device=device, dtype=dtype)
+        return q, k, v
+
+    check_seq_len = min(args.seq_len, args.check_seq_len)
+    q, k, v = make_inputs(check_seq_len)
+    expected = naive_attention(q, k, v, sm_scale)
+    actual = fwd_attention(q, k, v, sm_scale)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    q, k, v = make_inputs(args.seq_len)
+    baseline_ms = triton.testing.do_bench(
+        lambda: naive_attention(q, k, v, sm_scale),
+        warmup=args.warmup,
+        rep=args.rep,
+    )
+    kernel_ms = triton.testing.do_bench(
+        lambda: fwd_attention(q, k, v, sm_scale),
+        warmup=args.warmup,
+        rep=args.rep,
+    )
+
+    print(
+        f"simple_flash_attention batch={args.batch} heads={args.heads} "
+        f"seq_len={args.seq_len} dim={args.dim}"
+    )
+    print(
+        f"naive={baseline_ms:.3f} ms kernel={kernel_ms:.3f} ms "
+        f"speedup={baseline_ms / kernel_ms:.2f}x"
+    )
+
+
+if __name__ == "__main__":
+    main()

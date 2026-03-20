@@ -10,22 +10,24 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def pope_fwd_kernel(
-    Q, K, V, O, 
+def pope_fwd_kernel_optimized(
+    Q, K, V, O,
+    Q_cos, Q_sin, K_cos, K_sin,
     sm_scale,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
     stride_oz, stride_oh, stride_om, stride_ok,
+    stride_angle_s, stride_angle_d,
     N_CTX, # number of tokens
-    V_DIM: tl.constexpr, # dimension of V
-    QK_DIM: tl.constexpr, # dimension of Q and K
+    D: tl.constexpr, # dimension of the head
     H: tl.constexpr, # number of heads
     BLOCK_N: tl.constexpr, # kv rows per tile
     BLOCK_M: tl.constexpr # query rows per tile
 ):
     """
     kernel for forward pass of flash attention using PoPE positional embedding
+    performs rotations inside the kernel to halve memory usage
     """
 
     # grid indices from triton process
@@ -43,12 +45,25 @@ def pope_fwd_kernel(
     o_offs = off_z * stride_oz + off_h * stride_oh
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N) # updated inside loop
-    offs_d_qk = tl.arange(0, QK_DIM)
-    offs_d_v = tl.arange(0, V_DIM)
+    offs_d = tl.arange(0, D)
 
     # load query tile
-    q_ptrs = Q + q_offs + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
+    q_ptrs = Q + q_offs + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
     q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    # load trig tables for query positions
+    q_cos_ptrs = Q_cos + offs_m[:, None] * stride_angle_s + offs_d[None, :] * stride_angle_d
+    q_sin_ptrs = Q_sin + offs_m[:, None] * stride_angle_s + offs_d[None, :] * stride_angle_d
+    q_cos = tl.load(q_cos_ptrs, mask=offs_m[:, None] < N_CTX, other = 0.0)
+    q_sin = tl.load(q_sin_ptrs, mask=offs_m[:, None] < N_CTX, other = 0.0)
+
+    # safe softplus implementation
+    q_float = q.to(tl.float32)
+    mu_q = tl.where(q_float > 20.0, q_float, tl.log(1.0 + tl.exp(q_float)))
+
+    # compute polar coordinates in register, avoids wasted memory usage
+    q_x = (mu_q * q_cos).to(q.dtype)
+    q_y = (mu_q * q_sin).to(q.dtype)
 
     # online softmax values
     # max logit so far
@@ -56,19 +71,35 @@ def pope_fwd_kernel(
     # sum of exponentials (denominator)
     denom = tl.zeros([BLOCK_M], dtype=tl.float32)
     # running numerator
-    numer = tl.zeros([BLOCK_M, V_DIM], dtype=tl.float32)
+    numer = tl.zeros([BLOCK_M, D], dtype=tl.float32)
 
     for start_n in range(0, N_CTX, BLOCK_N):
         cur_n = start_n + offs_n
 
         # load k and v tiles
-        k_ptrs = K + k_offs + cur_n[:, None] * stride_kn + offs_d_qk[None, :] * stride_kk
-        v_ptrs = V + v_offs + cur_n[:, None] * stride_vn + offs_d_v[None, :] * stride_vk
+        k_ptrs = K + k_offs + cur_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+        v_ptrs = V + v_offs + cur_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
         k = tl.load(k_ptrs, mask=cur_n[:, None] < N_CTX, other=0.0)
         v = tl.load(v_ptrs, mask=cur_n[:, None] < N_CTX, other=0.0)
 
+        # load trig tables for k
+        k_cos_ptrs = K_cos + cur_n[:, None] * stride_angle_s + offs_d[None, :] * stride_angle_d
+        k_sin_ptrs = K_sin + cur_n[:, None] * stride_angle_s + offs_d[None, :] * stride_angle_d
+        k_cos = tl.load(k_cos_ptrs, mask=cur_n[:, None] < N_CTX, other = 0.0)
+        k_sin = tl.load(k_sin_ptrs, mask=cur_n[:, None] < N_CTX, other = 0.0) 
+
+        # softplus for k
+        k_float = k.to(tl.float32)
+        mu_k = tl.where(k_float > 20.0, k_float, tl.log(1.0 + tl.exp(k_float)))
+
+        # compute polar coords for k
+        k_x = (mu_k * k_cos).to(k.dtype)
+        k_y = (mu_k * k_sin).to(k.dtype)
+
         # dot prod for attention
-        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        qk_x = tl.dot(q_x, tl.trans(k_x))
+        qk_y = tl.dot(q_y, tl.trans(k_y))
+        qk = (qk_x + qk_y) * sm_scale
 
         # causal + bounds mask
         mask = (offs_m[:, None] >= cur_n[None, :]) & (cur_n[None, :] < N_CTX)
@@ -85,7 +116,7 @@ def pope_fwd_kernel(
         m_i = m_new
     
     numer = numer/denom[:, None]
-    out_ptrs = O + o_offs + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_ok
+    out_ptrs = O + o_offs + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
     tl.store(out_ptrs, numer, mask=offs_m[:, None] < N_CTX)
 
 def compute_theta(d, base=10000.0, device='cuda'):
@@ -94,28 +125,21 @@ def compute_theta(d, base=10000.0, device='cuda'):
     """
     return base ** (torch.arange(d, device=device, dtype=torch.float32) / d)
 
-def cartesian_pope(q, k, theta, delta=None):
+def compute_angle_matrix(S, theta, delta=None, device='cuda'):
     """
-    compute 2d expansions for q and k
+    compute S x d angle matrix
     """
-    S = q.shape[-2]
     
-    pos = torch.arange(S, device=q.device, dtype=torch.float32)
+    pos = torch.arange(S, device=device, dtype=torch.float32)
     phi_q = pos[:, None] * theta[None, :]
     phi_k = phi_q if delta is None else phi_q + delta[None, :]
 
-    mu_q = F.softplus(q)
-    mu_k = F.softplus(k)
+    q_cos = torch.cos(phi_q)
+    q_sin = torch.sin(phi_q)
+    k_cos = torch.cos(phi_k)
+    k_sin = torch.sin(phi_k)
 
-    q_real = mu_q * torch.cos(phi_q)
-    q_imag = mu_q * torch.sin(phi_q)
-    k_real = mu_k * torch.cos(phi_k)
-    k_imag = mu_k * torch.sin(phi_k)
-
-    q_2d = torch.cat([q_real, q_imag], dim=-1)
-    k_2d = torch.cat([k_real, k_imag], dim=-1)
-
-    return q_2d.to(q.dtype), k_2d.to(k.dtype)
+    return q_cos, q_sin, k_cos, k_sin
 
 def pope_fwd_attention(q, k, v, sm_scale):
     """
@@ -125,36 +149,34 @@ def pope_fwd_attention(q, k, v, sm_scale):
     # H = num heads
     # S = num tokens
     # d = v dimension
-    B, H, S, d_v = v.shape
+    B, H, S, D = v.shape
+    assert q.shape[-1] == k.shape[-1] == v.shape[-1]
 
     # compute theta
-    theta = compute_theta(d_v, device=q.device)
+    theta = compute_theta(D, device=q.device)
 
-    # compute 2d expansion of q and k
-    q_2d, k_2d = cartesian_pope(q, k, theta)
-
-    # get last dimension of q and k, should be 2x d
-    d_qk = q_2d.shape[-1]
-    assert d_qk == 2 * d_v
+    # compute trig tables
+    q_cos, q_sin, k_cos, k_sin = compute_angle_matrix(S, theta, device=q.device)
 
     out = torch.empty_like(v)
 
     # reduce block size for large head dims due to T4 memory limit
-    BLOCK_M = 32 if d_v >= 128 else 64
-    BLOCK_N = 32 if d_v >= 128 else 64
+    BLOCK_M = 32 if D >= 128 else 64
+    BLOCK_N = 32 if D >= 128 else 64
 
     grid = (triton.cdiv(S, BLOCK_M), B * H)
 
-    pope_fwd_kernel[grid](
-        q_2d, k_2d, v, out,
+    pope_fwd_kernel_optimized[grid](
+        q, k, v, out,
+        q_cos, q_sin, k_cos, k_sin,
         sm_scale,
-        q_2d.stride(0), q_2d.stride(1), q_2d.stride(2), q_2d.stride(3),
-        k_2d.stride(0), k_2d.stride(1), k_2d.stride(2), k_2d.stride(3),
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        q_cos.stride(0), q_cos.stride(1),
         N_CTX = S,
-        V_DIM = d_v,
-        QK_DIM = d_qk,
+        D = D,
         H = H,
         BLOCK_N = BLOCK_N,
         BLOCK_M = BLOCK_M
@@ -167,8 +189,21 @@ def naive_pope_attention(q, k, v, theta_c, sm_scale, delta=None):
     naive pope attention for correctness comparison
     materializes full S x S score matrix
     """
-    q_cart, k_cart = cartesian_pope(q, k, theta_c, delta)
-    scores = torch.matmul(q_cart, k_cart.transpose(-2, -1)) * sm_scale
+    q_cos, q_sin, k_cos, k_sin = compute_angle_matrix(
+        q.shape[-2], theta_c, delta=delta, device=q.device
+    )
+
+    mu_q = F.softplus(q)
+    mu_k = F.softplus(k)
+    q_x = (mu_q * q_cos).to(q.dtype)
+    q_y = (mu_q * q_sin).to(q.dtype)
+    k_x = (mu_k * k_cos).to(k.dtype)
+    k_y = (mu_k * k_sin).to(k.dtype)
+
+    scores = (
+        torch.matmul(q_x, k_x.transpose(-2, -1))
+        + torch.matmul(q_y, k_y.transpose(-2, -1))
+    ) * sm_scale
     causal_mask = torch.tril(
         torch.ones((q.shape[-2], k.shape[-2]), device=q.device, dtype=torch.bool)
     )
@@ -178,7 +213,7 @@ def naive_pope_attention(q, k, v, theta_c, sm_scale, delta=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark simple PoPE attention kernel.")
+    parser = argparse.ArgumentParser(description="Benchmark optimized PoPE attention kernel.")
     parser.add_argument("--batch", type=int, default=4)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=1024)
@@ -223,7 +258,7 @@ def main():
     )
 
     print(
-        f"simple_pope batch={args.batch} heads={args.heads} "
+        f"optimized_pope batch={args.batch} heads={args.heads} "
         f"seq_len={args.seq_len} dim={args.dim}"
     )
     print(
