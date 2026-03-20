@@ -1,3 +1,7 @@
+"""
+Simple implementation of flash attention forward pass
+"""
+
 import torch
 import triton 
 import triton.language as tl
@@ -26,7 +30,8 @@ def _fwd_kernel(
 
     # initialize offsets
     qo_offs = off_z * stride_qz + off_h * stride_qh
-    kv_offs = off_z * stride_kz + off_h * stride_kh
+    k_offs = off_z * stride_kz + off_h * stride_kh
+    v_offs = off_z * stride_vz + off_h * stride_vh
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N) # updated inside loop
     offs_d = tl.arange(0, D)
@@ -47,8 +52,8 @@ def _fwd_kernel(
         cur_n = start_n + offs_n
 
         # load k and v tiles
-        k_ptrs = K + kv_offs + cur_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
-        v_ptrs = V + kv_offs + cur_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+        k_ptrs = K + k_offs + cur_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+        v_ptrs = V + v_offs + cur_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
         k = tl.load(k_ptrs, mask=cur_n[:, None] < N_CTX, other=0.0)
         v = tl.load(v_ptrs, mask=cur_n[:, None] < N_CTX, other=0.0)
 
@@ -56,7 +61,7 @@ def _fwd_kernel(
         qk = tl.dot(q, tl.trans(k)) * sm_scale
 
         # causal + bounds mask
-        mask = (offs_m[:, None] >= cur_n[None, :]) & (cur_n[:, None] < N_CTX)
+        mask = (offs_m[:, None] >= cur_n[None, :]) & (cur_n[None, :] < N_CTX)
         qk = tl.where(mask, qk, float("-inf"))
 
         # online softmax
