@@ -52,6 +52,7 @@ def fwd_kernel(
     denom = tl.zeros([BLOCK_M], dtype=tl.float32)
     # running numerator
     numer = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+    valid_q = offs_m < N_CTX
 
     for start_n in range(0, N_CTX, BLOCK_N):
         cur_n = start_n + offs_n
@@ -61,27 +62,27 @@ def fwd_kernel(
         v_ptrs = V + v_offs + cur_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
         k = tl.load(k_ptrs, mask=cur_n[:, None] < N_CTX, other=0.0)
         v = tl.load(v_ptrs, mask=cur_n[:, None] < N_CTX, other=0.0)
+        v = v.to(tl.float32)
 
         # dot prod for attention
         qk = tl.dot(q, tl.trans(k)) * sm_scale
 
         # causal + bounds mask
-        mask = (offs_m[:, None] >= cur_n[None, :]) & (cur_n[None, :] < N_CTX)
+        mask = valid_q[:, None] & (offs_m[:, None] >= cur_n[None, :]) & (cur_n[None, :] < N_CTX)
         qk = tl.where(mask, qk, float("-inf"))
 
         # online softmax
-        valid_q = offs_m < N_CTX
         m_ij = tl.where(valid_q, tl.max(qk, axis=1), m_i)
-        m_new = tl.max(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.where(valid_q, tl.exp(m_i - m_new), 0.0)
         p_curr = tl.where(mask, tl.exp(qk - m_new[:, None]), 0.0)
         denom = denom * alpha + tl.sum(p_curr, axis=1)
         numer = numer * alpha[:, None] + tl.dot(p_curr, v)
         m_i = m_new
     
-    numer = numer/denom[:, None]
+    numer = tl.where(valid_q[:, None], numer / denom[:, None], 0.0)
     out_ptrs = O + qo_offs + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
-    tl.store(out_ptrs, numer, mask=offs_m[:, None] < N_CTX)
+    tl.store(out_ptrs, numer, mask=valid_q[:, None])
 
 def fwd_attention(q, k, v, sm_scale):
     """
